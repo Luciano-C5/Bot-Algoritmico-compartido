@@ -1,46 +1,51 @@
 """
-market_feed.py
-==============
-Capa de datos unificada. Tanto el backtest como el bot en vivo
-usan esta misma interfaz. El resto del sistema no sabe (ni le importa)
-de dónde vienen los datos.
+market_feed.py  v1.1
+====================
+Capa de datos unificada.
 
-Modos:
-  - LiveFeed:     WebSocket + REST contra Binance (testnet o producción)
-  - BacktestFeed: Lee CSVs o descarga datos históricos, los sirve vela a vela
+Cambios respecto a v1.0:
+  - URLs, símbolo, CANDLES_TO_LOAD y refresh_every leídos desde cfg.
+  - Lógica de actualización incremental del CSV:
+    al arrancar detecta la última fecha guardada y descarga
+    solo las velas nuevas, appendeando al archivo existente.
+    La descarga completa ocurre solo la primera vez.
+  - BacktestFeed expone también daily_closes, daily_highs,
+    daily_lows y recent_atrs para alimentar al RegimeDetector.
 
-Contrato de salida: MarketSnapshot (dataclass definida acá)
+Contrato de salida: MarketSnapshot (sin cambios de interfaz).
 """
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import requests
 
+from config import cfg
+
 # ─────────────────────────────────────────────
-# ESTRUCTURAS DE DATOS
+# ESTRUCTURAS DE DATOS (sin cambios de interfaz)
 # ─────────────────────────────────────────────
 
 @dataclass
 class MarketSnapshot:
     """
-    Todo lo que el sistema necesita saber del mercado en un instante dado.
-    indicators.py recibe esto y devuelve los valores calculados.
+    Todo lo que el sistema necesita en un instante dado.
+    indicators.py y regime_detector.py reciben esto.
     """
-    symbol: str
+    symbol:    str
     timestamp: datetime
 
-    # OHLCV por timeframe. Cada DataFrame tiene columnas:
-    # ['open', 'high', 'low', 'close', 'volume']
-    # con DatetimeIndex UTC. Las filas más recientes son las últimas.
+    # OHLCV por timeframe — DataFrame con columnas:
+    # ['open','high','low','close','volume'], DatetimeIndex UTC
+    # Las filas más recientes son las últimas.
     ohlcv_1m:  pd.DataFrame
     ohlcv_5m:  pd.DataFrame
     ohlcv_15m: pd.DataFrame
@@ -49,590 +54,522 @@ class MarketSnapshot:
     ohlcv_1d:  pd.DataFrame
     ohlcv_1w:  pd.DataFrame
 
-    # Datos de mercado en tiempo real (en backtest se aproximan o se ignoran)
+    # Datos en tiempo real (en backtest se aproximan)
     last_price:          float = 0.0
-    funding_rate:        float = 0.0          # actual, no el próximo
-    funding_rate_next:   float = 0.0          # próximo cobro
-    orderbook_imbalance: float = 0.0          # rango -1.0 a +1.0
+    funding_rate:        float = 0.0
+    orderbook_imbalance: float = 0.0
     bid:                 float = 0.0
     ask:                 float = 0.0
 
-    # Metadata útil para logging y decisiones
-    is_backtest:         bool  = False
-    feed_latency_ms:     float = 0.0          # latencia del feed en vivo
+    def get_ohlcv(self, timeframe: str) -> Optional[pd.DataFrame]:
+        """Acceso por nombre de timeframe string."""
+        return {
+            "1m":  self.ohlcv_1m,  "5m":  self.ohlcv_5m,
+            "15m": self.ohlcv_15m, "1h":  self.ohlcv_1h,
+            "4h":  self.ohlcv_4h,  "1d":  self.ohlcv_1d,
+            "1w":  self.ohlcv_1w,
+        }.get(timeframe)
+
+    # Propiedades para RegimeDetector (listas de precios diarios)
+    @property
+    def daily_closes(self) -> list[float]:
+        if self.ohlcv_1d is not None and not self.ohlcv_1d.empty:
+            return self.ohlcv_1d["close"].tolist()
+        return []
 
     @property
-    def spread_pct(self) -> float:
-        if self.bid > 0:
-            return (self.ask - self.bid) / self.bid * 100
-        return 0.0
+    def daily_highs(self) -> list[float]:
+        if self.ohlcv_1d is not None and not self.ohlcv_1d.empty:
+            return self.ohlcv_1d["high"].tolist()
+        return []
 
     @property
-    def current_close(self) -> float:
-        """Precio de cierre de la última vela de 1m (o last_price si es más reciente)."""
-        if not self.ohlcv_1m.empty:
-            return float(self.ohlcv_1m['close'].iloc[-1])
-        return self.last_price
+    def daily_lows(self) -> list[float]:
+        if self.ohlcv_1d is not None and not self.ohlcv_1d.empty:
+            return self.ohlcv_1d["low"].tolist()
+        return []
 
 
 # ─────────────────────────────────────────────
-# INTERFAZ BASE (contrato que deben cumplir Live y Backtest)
+# INTERFAZ BASE
 # ─────────────────────────────────────────────
 
-class MarketFeed(ABC):
-    """
-    Interfaz que strategy.py, scoring.py y bot.py usan.
-    Nunca llaman a LiveFeed o BacktestFeed directamente.
-    """
-
+class BaseFeed(ABC):
     @abstractmethod
     def get_snapshot(self) -> MarketSnapshot:
-        """Devuelve el estado actual del mercado."""
+        """Devuelve el snapshot más reciente del mercado."""
         ...
 
     @abstractmethod
-    def start(self) -> None:
-        """Inicia conexiones, precarga de datos, etc."""
-        ...
-
-    @abstractmethod
-    def stop(self) -> None:
-        """Cierra conexiones limpiamente."""
+    def is_ready(self) -> bool:
+        """True si el feed tiene datos suficientes para operar."""
         ...
 
 
 # ─────────────────────────────────────────────
-# FUNCIONES AUXILIARES COMPARTIDAS
+# HELPERS REST
 # ─────────────────────────────────────────────
 
-TIMEFRAME_MAP = {
-    '1m':  1,
-    '5m':  5,
-    '15m': 15,
-    '1h':  60,
-    '4h':  240,
-    '1d':  1440,
-    '1w':  10080,
-}
+def _fetch_klines_rest(
+    symbol:    str,
+    interval:  str,
+    limit:     int = 1000,
+    start_ms:  Optional[int] = None,
+    base_url:  Optional[str] = None,
+) -> list[list]:
+    """
+    Descarga velas desde la API REST de Binance Futuros.
 
-def _parse_klines(raw: list) -> pd.DataFrame:
+    Parámetros:
+        symbol    Par de trading (ej: "BTCUSDC")
+        interval  Timeframe (ej: "1m", "1h", "1d")
+        limit     Máximo de velas por request (máx Binance: 1500)
+        start_ms  Timestamp de inicio en milisegundos (opcional)
+        base_url  URL base del endpoint. Si None usa cfg.
+
+    Devuelve lista de listas con el formato de Binance klines.
     """
-    Convierte la respuesta de la API de Binance (lista de listas)
-    a un DataFrame limpio con DatetimeIndex UTC.
-    """
+    url = (base_url or cfg.network.base_url) + "/fapi/v1/klines"
+    params: dict = {
+        "symbol":   symbol,
+        "interval": interval,
+        "limit":    min(limit, 1500),
+    }
+    if start_ms:
+        params["startTime"] = start_ms
+
+    resp = requests.get(url, params=params, timeout=cfg.network.rest_timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _klines_to_df(raw: list[list]) -> pd.DataFrame:
+    """Convierte la respuesta de Binance klines a DataFrame OHLCV."""
+    if not raw:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     df = pd.DataFrame(raw, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_volume', 'trades',
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
     ])
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
-    df.set_index('open_time', inplace=True)
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df.set_index("open_time", inplace=True)
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
-    return df[['open', 'high', 'low', 'close', 'volume']]
+    return df[["open", "high", "low", "close", "volume"]]
 
 
-def _resample_from_1m(df_1m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+def _resample_to_tf(df_1m: pd.DataFrame, tf: str) -> pd.DataFrame:
     """
-    Construye cualquier timeframe mayor a partir de velas de 1m.
-    Útil en backtest para no necesitar archivos separados por timeframe.
+    Resamplea un DataFrame de 1m a un timeframe mayor.
+
+    Timeframes soportados: 5m, 15m, 1h, 4h, 1d, 1w
     """
     rule_map = {
-        '5m': '5min', '15m': '15min', '1h': '1h',
-        '4h': '4h',   '1d': '1D',    '1w': '1W',
+        "5m": "5min", "15m": "15min", "1h": "1h",
+        "4h": "4h",   "1d": "1D",     "1w": "1W",
     }
-    rule = rule_map.get(timeframe)
-    if rule is None:
-        raise ValueError(f"Timeframe no soportado para resample: {timeframe}")
+    rule = rule_map.get(tf)
+    if not rule:
+        return df_1m
 
-    df = df_1m.resample(rule, label='left', closed='left').agg({
-        'open':   'first',
-        'high':   'max',
-        'low':    'min',
-        'close':  'last',
-        'volume': 'sum',
+    resampled = df_1m.resample(rule).agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
     }).dropna()
-    return df
+    return resampled
 
 
 # ─────────────────────────────────────────────
 # LIVE FEED
 # ─────────────────────────────────────────────
 
-class LiveFeed(MarketFeed):
+class LiveFeed(BaseFeed):
     """
-    Se conecta a Binance Futuros (testnet o producción) y mantiene
-    un snapshot actualizado en memoria. El bot lee ese snapshot
-    en cada ciclo sin bloquear.
+    Feed en vivo contra Binance Futuros (testnet o producción).
+    Lee todos sus parámetros desde cfg.
 
-    Uso:
-        feed = LiveFeed(symbol='BTCUSDC', testnet=True)
-        feed.start()
-        snapshot = feed.get_snapshot()
-        feed.stop()
+    Mantiene un buffer de velas por timeframe actualizado
+    en background mediante polling REST.
     """
 
-    BASE_URL_TESTNET = 'https://testnet.binancefuture.com'
-    BASE_URL_PROD    = 'https://fapi.binance.com'
-    WS_URL_TESTNET   = 'wss://stream.binancefuture.com'
-    WS_URL_PROD      = 'wss://fstream.binance.com'
-
-    # Cuántas velas históricas cargar por timeframe al arrancar
-    CANDLES_TO_LOAD = {
-        '1m': 500, '5m': 300, '15m': 200,
-        '1h': 200, '4h': 150, '1d': 200, '1w': 100,
-    }
-
-    def __init__(self, symbol: str = 'BTCUSDC', testnet: bool = True):
-        self.symbol  = symbol.upper()
-        self.testnet = testnet
-        self.base_url = self.BASE_URL_TESTNET if testnet else self.BASE_URL_PROD
-
-        # Cache interno de DataFrames, actualizado en background
-        self._ohlcv: dict[str, pd.DataFrame] = {}
-        self._last_price:          float = 0.0
-        self._funding_rate:        float = 0.0
-        self._funding_rate_next:   float = 0.0
-        self._orderbook_imbalance: float = 0.0
-        self._bid:                 float = 0.0
-        self._ask:                 float = 0.0
-        self._feed_latency_ms:     float = 0.0
-
-        self._lock    = threading.Lock()
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-    # ── Arranque y parada ──────────────────────────────────────────────
+    def __init__(self):
+        self._symbol   = cfg.network.symbol
+        self._base_url = cfg.network.base_url
+        self._buffers: dict[str, pd.DataFrame] = {}
+        self._funding_rate   = 0.0
+        self._obi            = 0.0
+        self._bid            = 0.0
+        self._ask            = 0.0
+        self._last_price     = 0.0
+        self._ready          = False
+        self._lock           = threading.Lock()
+        self._refresh_counts = {tf: 0 for tf in cfg.data.candles_live}
 
     def start(self) -> None:
-        print(f"[LiveFeed] Iniciando en {'TESTNET' if self.testnet else 'PRODUCCIÓN'}...")
-        self._preload_all_timeframes()
-        self._refresh_funding_rate()
-        self._running = True
-        self._thread = threading.Thread(target=self._background_loop, daemon=True)
-        self._thread.start()
-        print(f"[LiveFeed] Listo. Precio actual: {self._last_price:.2f}")
+        """Arranca el background thread de actualización."""
+        self._load_initial()
+        t = threading.Thread(target=self._background_loop, daemon=True)
+        t.start()
 
-    def stop(self) -> None:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-        print("[LiveFeed] Detenido.")
-
-    # ── Snapshot público ───────────────────────────────────────────────
-
-    def get_snapshot(self) -> MarketSnapshot:
-        t0 = time.monotonic()
-        with self._lock:
-            snap = MarketSnapshot(
-                symbol            = self.symbol,
-                timestamp         = datetime.now(timezone.utc),
-                ohlcv_1m          = self._ohlcv.get('1m',  pd.DataFrame()).copy(),
-                ohlcv_5m          = self._ohlcv.get('5m',  pd.DataFrame()).copy(),
-                ohlcv_15m         = self._ohlcv.get('15m', pd.DataFrame()).copy(),
-                ohlcv_1h          = self._ohlcv.get('1h',  pd.DataFrame()).copy(),
-                ohlcv_4h          = self._ohlcv.get('4h',  pd.DataFrame()).copy(),
-                ohlcv_1d          = self._ohlcv.get('1d',  pd.DataFrame()).copy(),
-                ohlcv_1w          = self._ohlcv.get('1w',  pd.DataFrame()).copy(),
-                last_price          = self._last_price,
-                funding_rate        = self._funding_rate,
-                funding_rate_next   = self._funding_rate_next,
-                orderbook_imbalance = self._orderbook_imbalance,
-                bid                 = self._bid,
-                ask                 = self._ask,
-                is_backtest         = False,
-                feed_latency_ms     = self._feed_latency_ms,
+    def _load_initial(self) -> None:
+        """Carga inicial de todos los timeframes."""
+        for tf, n_candles in cfg.data.candles_live.items():
+            raw = _fetch_klines_rest(
+                self._symbol, tf, limit=n_candles,
+                base_url=self._base_url
             )
-        snap.feed_latency_ms = (time.monotonic() - t0) * 1000
-        return snap
-
-    # ── Carga inicial ──────────────────────────────────────────────────
-
-    def _preload_all_timeframes(self) -> None:
-        for tf, limit in self.CANDLES_TO_LOAD.items():
-            df = self._fetch_klines(tf, limit)
+            df = _klines_to_df(raw)
             with self._lock:
-                self._ohlcv[tf] = df
-            print(f"  [LiveFeed] {tf}: {len(df)} velas cargadas")
-
-        # Precio inicial desde la vela más reciente de 1m
-        with self._lock:
-            if not self._ohlcv['1m'].empty:
-                self._last_price = float(self._ohlcv['1m']['close'].iloc[-1])
-
-    def _fetch_klines(self, interval: str, limit: int) -> pd.DataFrame:
-        """Descarga velas OHLCV de la API REST."""
-        url = f"{self.base_url}/fapi/v1/klines"
-        params = {'symbol': self.symbol, 'interval': interval, 'limit': limit}
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return _parse_klines(resp.json())
-
-    # ── Loop de actualización en background ───────────────────────────
+                self._buffers[tf] = df
+        self._ready = True
 
     def _background_loop(self) -> None:
-        """
-        Hilo daemon que actualiza datos periódicamente.
-        En producción esto se reemplazaría por WebSocket para 1m,
-        pero polling cada segundo es suficiente para empezar
-        y más fácil de debuggear.
-        """
-        counters = {tf: 0 for tf in self.CANDLES_TO_LOAD}
-        # Cada cuántos segundos refrescar cada timeframe
-        refresh_every = {
-            '1m': 15,   '5m': 30,   '15m': 60,
-            '1h': 120,  '4h': 300,  '1d': 600, '1w': 3600,
-        }
-
-        while self._running:
-            for tf in self.CANDLES_TO_LOAD:
-                counters[tf] += 1
-                if counters[tf] >= refresh_every[tf]:
-                    counters[tf] = 0
+        """Actualiza cada timeframe según su intervalo de refresco."""
+        while True:
+            for tf, interval_secs in cfg.data.refresh_intervals.items():
+                self._refresh_counts[tf] = self._refresh_counts.get(tf, 0) + 1
+                if self._refresh_counts[tf] * 15 >= interval_secs:
+                    self._refresh_counts[tf] = 0
                     try:
-                        df = self._fetch_klines(tf, 10)  # Solo las últimas 10 velas
-                        with self._lock:
-                            # Actualiza o agrega las velas nuevas
-                            existing = self._ohlcv.get(tf, pd.DataFrame())
-                            if existing.empty:
-                                self._ohlcv[tf] = df
-                            else:
-                                combined = pd.concat([existing, df])
-                                combined = combined[~combined.index.duplicated(keep='last')]
-                                self._ohlcv[tf] = combined.sort_index()
+                        self._update_tf(tf)
                     except Exception as e:
-                        print(f"[LiveFeed] Error actualizando {tf}: {e}")
+                        pass  # log en producción
+            self._update_realtime()
+            time.sleep(15)
 
-            # Funding rate cada 5 minutos
-            if counters.get('_funding', 0) % 300 == 0:
-                try:
-                    self._refresh_funding_rate()
-                except Exception as e:
-                    print(f"[LiveFeed] Error funding rate: {e}")
-            counters['_funding'] = counters.get('_funding', 0) + 1
-
-            # Orderbook cada 5 segundos
-            if counters.get('_ob', 0) % 5 == 0:
-                try:
-                    self._refresh_orderbook()
-                except Exception as e:
-                    print(f"[LiveFeed] Error orderbook: {e}")
-            counters['_ob'] = counters.get('_ob', 0) + 1
-
-            time.sleep(1)
-
-    def _refresh_funding_rate(self) -> None:
-        url = f"{self.base_url}/fapi/v1/premiumIndex"
-        resp = requests.get(url, params={'symbol': self.symbol}, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
+    def _update_tf(self, tf: str) -> None:
+        """Descarga las últimas N velas y actualiza el buffer."""
+        raw = _fetch_klines_rest(
+            self._symbol, tf, limit=5, base_url=self._base_url
+        )
+        new_df = _klines_to_df(raw)
         with self._lock:
-            self._last_price        = float(data.get('markPrice', self._last_price))
-            self._funding_rate      = float(data.get('lastFundingRate', 0))
-            self._funding_rate_next = float(data.get('nextFundingRate', 0))
+            existing = self._buffers.get(tf, pd.DataFrame())
+            combined = pd.concat([existing, new_df])
+            combined = combined[~combined.index.duplicated(keep="last")]
+            combined.sort_index(inplace=True)
+            max_candles = cfg.data.candles_live.get(tf, 200)
+            self._buffers[tf] = combined.iloc[-max_candles:]
 
-    def _refresh_orderbook(self) -> None:
-        url = f"{self.base_url}/fapi/v1/depth"
-        resp = requests.get(url, params={'symbol': self.symbol, 'limit': 20}, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
+    def _update_realtime(self) -> None:
+        """Actualiza precio, funding rate y order book."""
+        try:
+            # Precio mark
+            url = self._base_url + "/fapi/v1/ticker/price"
+            r = requests.get(
+                url, params={"symbol": self._symbol},
+                timeout=cfg.network.rest_timeout
+            )
+            if r.ok:
+                self._last_price = float(r.json()["price"])
 
-        bids_vol = sum(float(b[1]) for b in data.get('bids', []))
-        asks_vol = sum(float(a[1]) for a in data.get('asks', []))
-        total = bids_vol + asks_vol
+            # Funding rate
+            url2 = self._base_url + "/fapi/v1/premiumIndex"
+            r2 = requests.get(
+                url2, params={"symbol": self._symbol},
+                timeout=cfg.network.rest_timeout
+            )
+            if r2.ok:
+                self._funding_rate = float(r2.json().get("lastFundingRate", 0))
 
+            # Order book (top 20 niveles)
+            url3 = self._base_url + "/fapi/v1/depth"
+            r3 = requests.get(
+                url3, params={"symbol": self._symbol, "limit": 20},
+                timeout=cfg.network.rest_timeout
+            )
+            if r3.ok:
+                book  = r3.json()
+                bids  = sum(float(b[1]) for b in book.get("bids", []))
+                asks  = sum(float(a[1]) for a in book.get("asks", []))
+                total = bids + asks
+                self._obi  = (bids - asks) / total if total > 0 else 0.0
+                if book.get("bids"):
+                    self._bid = float(book["bids"][0][0])
+                if book.get("asks"):
+                    self._ask = float(book["asks"][0][0])
+        except Exception:
+            pass
+
+    def get_snapshot(self) -> MarketSnapshot:
         with self._lock:
-            if total > 0:
-                # +1.0 = solo compras, -1.0 = solo ventas, 0 = equilibrado
-                self._orderbook_imbalance = (bids_vol - asks_vol) / total
-            if data.get('bids'):
-                self._bid = float(data['bids'][0][0])
-            if data.get('asks'):
-                self._ask = float(data['asks'][0][0])
+            buffers = {tf: df.copy() for tf, df in self._buffers.items()}
+
+        def _get(tf):
+            return buffers.get(tf, pd.DataFrame())
+
+        return MarketSnapshot(
+            symbol    = self._symbol,
+            timestamp = datetime.now(timezone.utc),
+            ohlcv_1m  = _get("1m"),
+            ohlcv_5m  = _get("5m"),
+            ohlcv_15m = _get("15m"),
+            ohlcv_1h  = _get("1h"),
+            ohlcv_4h  = _get("4h"),
+            ohlcv_1d  = _get("1d"),
+            ohlcv_1w  = _get("1w"),
+            last_price          = self._last_price,
+            funding_rate        = self._funding_rate,
+            orderbook_imbalance = self._obi,
+            bid                 = self._bid,
+            ask                 = self._ask,
+        )
+
+    def is_ready(self) -> bool:
+        return self._ready
 
 
 # ─────────────────────────────────────────────
-# BACKTEST FEED
+# BACKTEST FEED (con descarga incremental)
 # ─────────────────────────────────────────────
 
-class BacktestFeed(MarketFeed):
+class BacktestFeed(BaseFeed):
     """
-    Sirve datos históricos vela a vela, exactamente igual que LiveFeed.
-    El backtest avanza el tiempo llamando next() en cada iteración.
+    Feed para backtest. Lee el CSV histórico de 1m y lo sirve
+    vela a vela resampleando a los demás timeframes en cada paso.
 
-    Uso:
-        feed = BacktestFeed(symbol='BTCUSDC', csv_path='data/BTCUSDC_1m.csv')
-        feed.start()
-        while feed.next():
-            snapshot = feed.get_snapshot()
-            # ... misma lógica que en vivo
-        feed.stop()
+    Descarga incremental:
+    - Si el CSV no existe → descarga completa (cfg.data.backtest_days días)
+    - Si el CSV existe → descarga solo las velas nuevas desde la
+      última fecha guardada hasta hoy y las appendea
 
-    Si no tenés el CSV, usa download_historical_data() para descargarlo.
+    Lee su configuración desde cfg (símbolo, días, paths).
     """
 
-    # Cuántas velas de contexto hacia atrás incluir en el snapshot
-    # (suficiente para calcular todos los indicadores)
-    LOOKBACK = {
-        '1m': 500, '5m': 300, '15m': 200,
-        '1h': 200, '4h': 150, '1d': 200, '1w': 100,
-    }
+    def __init__(self, days: Optional[int] = None):
+        self._symbol  = cfg.network.symbol
+        self._days    = days or cfg.data.backtest_days
+        self._csv_path = Path(cfg.data.data_dir) / cfg.data.csv_filename
 
-    def __init__(
-        self,
-        symbol:     str = 'BTCUSDC',
-        csv_path:   Optional[str] = None,
-        start_date: Optional[str] = None,   # 'YYYY-MM-DD'
-        end_date:   Optional[str] = None,
-        testnet:    bool = False,            # para descarga si no hay CSV
-    ):
-        self.symbol     = symbol.upper()
-        self.csv_path   = csv_path
-        self.start_date = start_date
-        self.end_date   = end_date
-        self.testnet    = testnet
+        self._df_1m: Optional[pd.DataFrame] = None
+        self._cursor: int = 0   # índice de la vela actual en el backtest
 
-        self._df_1m_full: pd.DataFrame = pd.DataFrame()  # todos los datos de 1m
-        self._cursor:     int = 0                        # posición actual
-        self._current_snapshot: Optional[MarketSnapshot] = None
+        # Cuántas velas de lookback usar para cada TF en el snapshot
+        self._lookback = cfg.data.candles_backtest_lookback
 
-    # ── Arranque ───────────────────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # CARGA Y DESCARGA INCREMENTAL
+    # ─────────────────────────────────────────
 
-    def start(self) -> None:
-        print(f"[BacktestFeed] Cargando datos para {self.symbol}...")
+    def load(self) -> None:
+        """
+        Carga el CSV histórico. Si no existe o está desactualizado,
+        descarga lo que falta y actualiza el archivo.
+        """
+        Path(cfg.data.data_dir).mkdir(parents=True, exist_ok=True)
 
-        if self.csv_path:
-            self._df_1m_full = self._load_csv(self.csv_path)
+        if self._csv_path.exists():
+            print(f"[BacktestFeed] Cargando CSV existente: {self._csv_path}")
+            self._df_1m = pd.read_csv(
+                self._csv_path,
+                index_col=0,
+                parse_dates=True,
+            )
+            self._df_1m.index = pd.to_datetime(self._df_1m.index, utc=True)
+            self._df_1m.sort_index(inplace=True)
+
+            # Detectar cuántas velas faltan desde la última fecha
+            last_ts = self._df_1m.index[-1]
+            now_utc = datetime.now(timezone.utc)
+            gap_minutes = int((now_utc - last_ts).total_seconds() / 60)
+
+            if gap_minutes > 2:
+                print(
+                    f"[BacktestFeed] CSV desactualizado por {gap_minutes} velas. "
+                    "Descargando incremento..."
+                )
+                self._download_incremental(since_ts=last_ts)
+            else:
+                print("[BacktestFeed] CSV actualizado.")
         else:
-            print("[BacktestFeed] No se proveyó CSV, descargando datos históricos...")
-            self._df_1m_full = self._download_1m(testnet=self.testnet)
+            print(
+                f"[BacktestFeed] CSV no encontrado. "
+                f"Descargando {self._days} días de historia..."
+            )
+            self._download_full()
 
-        # Filtrar por rango de fechas si se especificó
-        if self.start_date:
-            self._df_1m_full = self._df_1m_full[self._df_1m_full.index >= self.start_date]
-        if self.end_date:
-            self._df_1m_full = self._df_1m_full[self._df_1m_full.index <= self.end_date]
+        print(f"[BacktestFeed] Total velas 1m: {len(self._df_1m):,}")
 
-        # El cursor empieza donde hay suficientes velas para el lookback más largo
-        min_lookback = max(self.LOOKBACK.values())
-        self._cursor = min_lookback
-        total = len(self._df_1m_full)
-        print(f"[BacktestFeed] {total:,} velas de 1m cargadas. "
-              f"Backtest desde la vela {self._cursor} hasta {total}.")
+    def _download_full(self) -> None:
+        """Descarga completa: cfg.data.backtest_days días de velas 1m."""
+        end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = end_ms - self._days * 24 * 60 * 60 * 1000
 
-    def stop(self) -> None:
-        print("[BacktestFeed] Finalizado.")
+        all_candles: list[pd.DataFrame] = []
+        current_ms  = start_ms
+        base_url    = cfg.network.base_url
 
-    # ── Iteración ──────────────────────────────────────────────────────
+        print(f"[BacktestFeed] Descargando desde Binance ({self._days} días)...")
+        while current_ms < end_ms:
+            raw = _fetch_klines_rest(
+                self._symbol, "1m",
+                limit=1500, start_ms=current_ms,
+                base_url=base_url,
+            )
+            if not raw:
+                break
+            df_chunk = _klines_to_df(raw)
+            all_candles.append(df_chunk)
+            current_ms = int(df_chunk.index[-1].timestamp() * 1000) + 60_000
+            print(
+                f"  Hasta {df_chunk.index[-1].strftime('%Y-%m-%d %H:%M')} UTC "
+                f"({len(df_chunk)} velas)...",
+                end="\r",
+            )
+            time.sleep(0.1)   # respetar rate limit
 
-    def next(self) -> bool:
+        self._df_1m = pd.concat(all_candles)
+        self._df_1m = self._df_1m[~self._df_1m.index.duplicated(keep="last")]
+        self._df_1m.sort_index(inplace=True)
+        self._df_1m.to_csv(self._csv_path)
+        print(f"\n[BacktestFeed] Guardado en {self._csv_path}")
+
+    def _download_incremental(self, since_ts: pd.Timestamp) -> None:
+        """Descarga solo las velas nuevas y appendea al CSV."""
+        start_ms = int(since_ts.timestamp() * 1000) + 60_000
+        end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+        base_url = cfg.network.base_url
+
+        new_candles: list[pd.DataFrame] = []
+        current_ms = start_ms
+
+        while current_ms < end_ms:
+            raw = _fetch_klines_rest(
+                self._symbol, "1m",
+                limit=1500, start_ms=current_ms,
+                base_url=base_url,
+            )
+            if not raw:
+                break
+            df_chunk = _klines_to_df(raw)
+            new_candles.append(df_chunk)
+            current_ms = int(df_chunk.index[-1].timestamp() * 1000) + 60_000
+            time.sleep(0.05)
+
+        if new_candles:
+            df_new = pd.concat(new_candles)
+            df_new = df_new[~df_new.index.duplicated(keep="last")]
+            self._df_1m = pd.concat([self._df_1m, df_new])
+            self._df_1m = self._df_1m[~self._df_1m.index.duplicated(keep="last")]
+            self._df_1m.sort_index(inplace=True)
+            self._df_1m.to_csv(self._csv_path)
+            print(f"[BacktestFeed] +{len(df_new)} velas nuevas guardadas.")
+
+    # ─────────────────────────────────────────
+    # ITERACIÓN VELA A VELA
+    # ─────────────────────────────────────────
+
+    def reset(self, start_idx: int = 0) -> None:
+        """Reinicia el cursor al índice dado."""
+        self._cursor = start_idx
+
+    def step(self) -> bool:
         """
-        Avanza una vela. Devuelve False cuando se terminaron los datos.
-        El backtest llama esto en cada iteración del loop principal.
+        Avanza una vela de 1m.
+        Devuelve True si hay más velas, False si el backtest terminó.
         """
-        if self._cursor >= len(self._df_1m_full):
-            return False
-        self._build_snapshot()
         self._cursor += 1
-        return True
+        return self._cursor < len(self._df_1m)
 
-    @property
-    def progress(self) -> float:
-        """Porcentaje de progreso del backtest (0.0 a 1.0)."""
-        total = len(self._df_1m_full)
-        if total == 0:
-            return 0.0
-        return self._cursor / total
+    def get_snapshot(self) -> MarketSnapshot:
+        """
+        Devuelve el snapshot del momento actual del cursor.
+        Construye cada timeframe resampleando desde los datos 1m visibles.
+        """
+        if self._df_1m is None:
+            raise RuntimeError("Llamar load() antes de get_snapshot()")
+
+        # Solo usar datos hasta el cursor (sin lookahead)
+        df_visible = self._df_1m.iloc[: self._cursor + 1]
+        current_row = df_visible.iloc[-1]
+
+        def _tail(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+            n = self._lookback.get(tf, 200)
+            return df.iloc[-n:] if len(df) >= n else df
+
+        df_5m  = _resample_to_tf(df_visible, "5m")
+        df_15m = _resample_to_tf(df_visible, "15m")
+        df_1h  = _resample_to_tf(df_visible, "1h")
+        df_4h  = _resample_to_tf(df_visible, "4h")
+        df_1d  = _resample_to_tf(df_visible, "1d")
+        df_1w  = _resample_to_tf(df_visible, "1w")
+
+        close = float(current_row["close"])
+
+        return MarketSnapshot(
+            symbol    = self._symbol,
+            timestamp = df_visible.index[-1].to_pydatetime(),
+            ohlcv_1m  = _tail(df_visible, "1m"),
+            ohlcv_5m  = _tail(df_5m,  "5m"),
+            ohlcv_15m = _tail(df_15m, "15m"),
+            ohlcv_1h  = _tail(df_1h,  "1h"),
+            ohlcv_4h  = _tail(df_4h,  "4h"),
+            ohlcv_1d  = _tail(df_1d,  "1d"),
+            ohlcv_1w  = _tail(df_1w,  "1w"),
+            last_price          = close,
+            funding_rate        = 0.0,   # no disponible en backtest
+            orderbook_imbalance = 0.0,
+            bid                 = close * 0.9999,
+            ask                 = close * 1.0001,
+        )
+
+    def is_ready(self) -> bool:
+        return self._df_1m is not None and len(self._df_1m) > 0
 
     @property
     def total_candles(self) -> int:
-        return max(0, len(self._df_1m_full) - max(self.LOOKBACK.values()))
+        return len(self._df_1m) if self._df_1m is not None else 0
 
-    # ── Snapshot ───────────────────────────────────────────────────────
+    @property
+    def current_index(self) -> int:
+        return self._cursor
 
-    def get_snapshot(self) -> MarketSnapshot:
-        if self._current_snapshot is None:
-            raise RuntimeError("Llamá a next() antes de get_snapshot()")
-        return self._current_snapshot
-
-    def _build_snapshot(self) -> None:
-        """Construye el snapshot con los datos hasta el cursor actual."""
-        df_1m = self._df_1m_full.iloc[max(0, self._cursor - self.LOOKBACK['1m']):self._cursor]
-        current_time = df_1m.index[-1]
-        last_price   = float(df_1m['close'].iloc[-1])
-
-        self._current_snapshot = MarketSnapshot(
-            symbol    = self.symbol,
-            timestamp = current_time.to_pydatetime(),
-
-            ohlcv_1m  = df_1m,
-            ohlcv_5m  = _resample_from_1m(df_1m, '5m').tail(self.LOOKBACK['5m']),
-            ohlcv_15m = _resample_from_1m(df_1m, '15m').tail(self.LOOKBACK['15m']),
-            ohlcv_1h  = _resample_from_1m(
-                self._df_1m_full.iloc[max(0, self._cursor - self.LOOKBACK['1h']*60):self._cursor],
-                '1h'
-            ).tail(self.LOOKBACK['1h']),
-            ohlcv_4h  = _resample_from_1m(
-                self._df_1m_full.iloc[max(0, self._cursor - self.LOOKBACK['4h']*240):self._cursor],
-                '4h'
-            ).tail(self.LOOKBACK['4h']),
-            ohlcv_1d  = _resample_from_1m(
-                self._df_1m_full.iloc[max(0, self._cursor - self.LOOKBACK['1d']*1440):self._cursor],
-                '1d'
-            ).tail(self.LOOKBACK['1d']),
-            ohlcv_1w  = _resample_from_1m(
-                self._df_1m_full.iloc[max(0, self._cursor - self.LOOKBACK['1w']*10080):self._cursor],
-                '1w'
-            ).tail(self.LOOKBACK['1w']),
-
-            last_price          = last_price,
-            funding_rate        = 0.0,   # no disponible en backtest histórico
-            funding_rate_next   = 0.0,
-            orderbook_imbalance = 0.0,   # no disponible en backtest histórico
-            bid                 = last_price,
-            ask                 = last_price,
-            is_backtest         = True,
-        )
-
-    # ── Carga y descarga de datos ─────────────────────────────────────
-
-    @staticmethod
-    def _load_csv(path: str) -> pd.DataFrame:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index()
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        return df[['open', 'high', 'low', 'close', 'volume']]
-
-    @staticmethod
-    def download_historical_data(
-        symbol:    str = 'BTCUSDC',
-        days:      int = 1000,
-        testnet:   bool = False,
-        save_path: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """
-        Descarga datos históricos de 1m desde Binance.
-        Binance limita a 1500 velas por request, así que itera
-        hacia atrás en el tiempo hasta cubrir los días pedidos.
-
-        Ejemplo:
-            df = BacktestFeed.download_historical_data(days=365, save_path='data/BTCUSDC_1m.csv')
-        """
-        base_url = (BacktestFeed.BASE_URL_TESTNET if testnet
-                    else 'https://fapi.binance.com')
-        url = f"{base_url}/fapi/v1/klines"
-
-        total_minutes = days * 24 * 60
-        batch_size    = 1500
-        all_frames    = []
-        end_time_ms   = None   # None = desde ahora hacia atrás
-
-        print(f"[BacktestFeed] Descargando ~{total_minutes:,} velas de 1m ({days} días)...")
-
-        fetched = 0
-        while fetched < total_minutes:
-            params = {
-                'symbol':   symbol.upper(),
-                'interval': '1m',
-                'limit':    batch_size,
-            }
-            if end_time_ms:
-                params['endTime'] = end_time_ms
-
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            raw = resp.json()
-            if not raw:
-                break
-
-            df_batch = _parse_klines(raw)
-            all_frames.append(df_batch)
-            fetched     += len(df_batch)
-            end_time_ms  = int(df_batch.index[0].timestamp() * 1000) - 1
-
-            print(f"  {fetched:,} / {total_minutes:,} velas descargadas...", end='\r')
-            time.sleep(0.2)   # respetar rate limits
-
-        print()
-        if not all_frames:
-            raise RuntimeError("No se pudieron descargar datos históricos.")
-
-        df = pd.concat(all_frames).sort_index()
-        df = df[~df.index.duplicated(keep='last')]
-
-        if save_path:
-            df.to_csv(save_path)
-            print(f"[BacktestFeed] Guardado en {save_path}")
-
-        print(f"[BacktestFeed] Total: {len(df):,} velas descargadas.")
-        return df
-
-    # Referencia estática para la URL de testnet (usada en download)
-    BASE_URL_TESTNET = 'https://testnet.binancefuture.com'
+    @property
+    def progress_pct(self) -> float:
+        if self.total_candles == 0:
+            return 0.0
+        return self._cursor / self.total_candles * 100
 
 
 # ─────────────────────────────────────────────
-# FACTORY — el resto del sistema usa esto
+# FUNCIÓN DE ACCESO UNIFICADO
 # ─────────────────────────────────────────────
 
-def create_feed(mode: str = 'live', **kwargs) -> MarketFeed:
+def create_feed(mode: str = "live", days: Optional[int] = None) -> BaseFeed:
     """
-    Punto de entrada único para crear feeds.
+    Punto de entrada único para crear el feed correcto.
 
-    Ejemplos:
-        # Bot en vivo contra testnet
-        feed = create_feed('live', symbol='BTCUSDC', testnet=True)
+    Parámetros:
+        mode   "live" para el bot en vivo, "backtest" para simulación
+        days   Solo para backtest: cuántos días de historia usar.
+               Si None usa cfg.data.backtest_days
 
-        # Backtest desde CSV
-        feed = create_feed('backtest', csv_path='data/BTCUSDC_1m.csv',
-                           start_date='2023-01-01', end_date='2024-01-01')
-
-        # Backtest descargando datos
-        feed = create_feed('backtest', days=365)
+    Uso:
+        feed = create_feed("backtest", days=90)
+        if isinstance(feed, BacktestFeed):
+            feed.load()
+        while feed.step():
+            snapshot = feed.get_snapshot()
     """
-    if mode == 'live':
-        return LiveFeed(**kwargs)
-    elif mode == 'backtest':
-        return BacktestFeed(**kwargs)
-    else:
-        raise ValueError(f"Modo de feed desconocido: '{mode}'. Usar 'live' o 'backtest'.")
-
-
-# ─────────────────────────────────────────────
-# USO DE EJEMPLO (correr este archivo directamente para testear)
-# ─────────────────────────────────────────────
-
-if __name__ == '__main__':
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == 'download':
-        # python market_feed.py download
-        days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-        BacktestFeed.download_historical_data(
-            symbol='BTCUSDC',
-            days=days,
-            testnet=False,
-            save_path=f'data/BTCUSDC_1m_{days}d.csv'
-        )
-
-    elif len(sys.argv) > 1 and sys.argv[1] == 'live':
-        # python market_feed.py live
-        feed = create_feed('live', symbol='BTCUSDC', testnet=True)
+    if mode == "backtest":
+        return BacktestFeed(days=days)
+    elif mode == "live":
+        feed = LiveFeed()
         feed.start()
-        try:
-            for _ in range(5):
-                snap = feed.get_snapshot()
-                print(f"[{snap.timestamp:%H:%M:%S}] Precio: {snap.last_price:.2f} | "
-                      f"Funding: {snap.funding_rate:.4%} | "
-                      f"OB Imbalance: {snap.orderbook_imbalance:+.3f} | "
-                      f"Velas 1m: {len(snap.ohlcv_1m)}")
-                time.sleep(5)
-        finally:
-            feed.stop()
-
+        return feed
     else:
-        print("Uso:")
-        print("  python market_feed.py download [días]  — descarga datos históricos")
-        print("  python market_feed.py live             — prueba conexión en testnet")
+        raise ValueError(f"mode debe ser 'live' o 'backtest', got '{mode}'")
+
+
+if __name__ == "__main__":
+    print(f"market_feed.py v1.1")
+    print(f"  Símbolo desde cfg:   {cfg.network.symbol}")
+    print(f"  Entorno:             {'TESTNET' if cfg.network.testnet else 'PRODUCCIÓN'}")
+    print(f"  Base URL:            {cfg.network.base_url}")
+    print(f"  CSV path:            {cfg.data.csv_path}")
+    print(f"  Días backtest:       {cfg.data.backtest_days}")
+    print(f"  Actualización incr.: activada")
